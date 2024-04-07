@@ -1,0 +1,602 @@
+---
+title: "Multimodal single-cell RNA-seq analysis"
+author: "Anna Szymik"
+date: "2023-06-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(reshape2)  # melt function
+library(RColorBrewer)
+library(caret)
+library(glmnet)
+library(ranger)  # C++ random forest implementation
+library(xgboost)
+library(parallel)
+library(parallelMap)
+
+en_train_errors <- read.table("en_train_errors.csv", header = TRUE, row.names = 1)
+en_valid_errors <- read.table("en_valid_errors.csv", header = TRUE, row.names = 1)
+rf_hyper_grid <- read.table("rf_hyper_grid.csv", header = TRUE, row.names = 1)
+
+conv_cs <- read.table("conv_cs.csv", header = TRUE, row.names = 1)
+conv_eta <- read.table("conv_eta.csv", header = TRUE, row.names = 1)
+conv_gamma <- read.table("conv_gamma.csv", header = TRUE, row.names = 1)
+conv_mcw <- read.table("conv_mcw.csv", header = TRUE, row.names = 1)
+conv_md <- read.table("conv_md.csv", header = TRUE, row.names = 1)
+conv_ss <- read.table("conv_ss.csv", header = TRUE, row.names = 1)
+```
+
+## Data exploration
+
+```{r data}
+# Load the data as matrices, as they will be used by the functions we will use
+y_train <- read.delim('y_train.csv', sep=',', dec='.')
+y <- y_train$Expected
+X_train <- as.matrix(read.delim('X_train.csv', sep=',', dec='.'))
+X_test <- as.matrix(read.delim('X_test.csv', sep=',', dec='.'))
+```
+
+```{r, eval = FALSE}
+# Check the type of values in columns
+unlist(lapply(X_test, class))
+str(y_train)
+str(X_test)
+```
+
+```{r, eval = FALSE}
+# Check if there are any missing values
+colSums(is.na(X_train))
+colSums(is.na(X_test))
+colSums(is.na(y_train))
+```
+
+```{r}
+# Check data dimensions
+dim(X_train)
+dim(y_train)
+dim(X_test)
+```
+
+The training data contains observations from 3794 cells, concerning the expression of 9000 genes – this is a typical case for RNA-Seq analysis with $p > n$, where special caution is needed to avoid overfitting. The test data contains 670 expression values of the same 9000 genes. The data is complete, and the columns are numeric, so no conversion is needed.
+
+### Empirical distribution of the explained variable
+
+Let’s start by calculating basic statistics, such as the mean, median, and standard deviation from the sample.
+
+```{r statistics}
+mean(y_train$Expected)
+median(y_train$Expected)
+sd(y_train$Expected)
+```
+
+Now let’s present the data on the charts.
+
+```{r histogram}
+hist(y_train$Expected, breaks = "Sturges", main = "Histogram of the explained variable", xlab = "y value")
+```
+
+```{r density}
+ggplot(data = data.frame(y_train$Expected), aes(x = y_train$Expected)) +
+  geom_density(fill = "blue", alpha = 0.5) +
+  labs(title = "Density estimator of the explained variable", x = "y value", y = "density")
+```
+
+The distribution of the explained variable is bimodal, with the majority of values concentrated around one and the second significant part concentrated around five.
+
+
+### Correlation heatmap
+
+Correlation heatmap of the 250 explanatory variables most correlated with the explained variable.
+
+```{r heatmap}
+# Znajdujemy zmienne najbardziej skorelowane z y
+cor_matrix <- cor(X_train, y_train$Expected)
+top <- order(abs(cor_matrix[,1]), decreasing=TRUE)[1:250]
+selected_vars <- X_train[, top]
+
+# Change the order to make the heatmap more readable
+selected_order <- cor(selected_vars, selected_vars[,1])
+selected_order <- selected_order[order(selected_order, decreasing = TRUE),]
+selected_order <- names(selected_order)
+cor_selected <- cor(X_train[,selected_order])
+
+# Create a heatmap
+heatmap(cor_selected,
+        Rowv = NA,
+        Colv = NA,
+        scale = "none",
+        col = colorRampPalette(brewer.pal(8, "Spectral"))(25))
+
+legend(x="right",
+       legend=c("(-1.0, -0.75)", "(-0.75, -0.5)", "(-0.5, -0.25)", "(-0.25, 0.0)", "(0.0, 0.25)","(0.25, 0.5)", "(0.5, 0.75)", "(0.75, 1.0)"),
+       fill=colorRampPalette(brewer.pal(8, "Spectral"))(8), cex = 0.6)
+```
+
+
+## ElasticNet
+
+### Method description
+
+The ElasticNet model is a combination of Ridge Regression and Lasso Regression. It is used to solve regression problems, especially in cases where the dataset contains many explanatory variables that may be correlated with each other.
+ElasticNet estimates the regression coefficients for each explanatory variable by minimizing the cost function of the following form:
+
+$$
+L(\beta) = \text{RSS}(\beta) + \lambda \sum_{j=1}^{p}(\alpha |\beta_j| + \frac{1-\alpha}{2}\beta_j^2)
+$$
+
+The cost function is a combination of two components:
+
+* linear L1 norm – as in Lasso Regression – promoting sparsity in the resulting coefficients, meaning that many of them can be exactly equal to zero, thus leading to variable selection;
+* quadratic L2 norm – as in Ridge Regression – reducing the values of the coefficients, but not causing them to be exactly zeroed.
+
+Hyperparameters of the method:
+
+* $\alpha$ – the mixing coefficient between Lasso Regression and Ridge Regression. $\alpha$ controls the balance between variable selection (Lasso Regression) and coefficient reduction (Ridge Regression). For a value of 0, we are dealing with pure Ridge Regression, and for 1 – with pure Lasso Regression.
+* $\lambda$ – the regularization parameter, controlling how strongly parameters are pulled to 0. The larger the value of $\lambda$, the stronger the regularization and the smaller the value of the regression coefficients.
+
+
+### Hyperparameter grid
+
+Let’s define the following hyperparameter grid for the method:
+
+```{r enet grid}
+alphas <- seq(0, 1, by=0.1)
+lambdas <- seq(1, 0, by=-0.1)
+```
+
+Let’s perform $k$-fold cross-validation to select the parameter combination that gives the smallest validation error. Let’s assume $k=5$, one of the two most commonly used values, which gives satisfactory results while not consuming as much computing power as cross-validation with $k=10$.
+
+```{r}
+k <- 5  # number of folds
+set.seed(3)  # random seed for result reproducibility
+folds <- createFolds(y, k)
+```
+
+```{r enet, eval=FALSE}
+parallelStartSocket(cpus=detectCores())
+
+# Matrices to store training and validation errors
+en_train_errors <- matrix(NA, nrow = length(alphas), ncol = length(lambdas))
+en_valid_errors <- matrix(NA, nrow = length(alphas), ncol = length(lambdas))
+
+# 5-fold cross-validation for each parameter combination
+for (i in 1:length(alphas)) {
+    train_errors <- c(1:length(lambdas))
+    valid_errors <- c(1:length(lambdas))
+    
+    for (fold in 1:k) {
+      train_index <- unlist(folds[-fold])  # indices of the training subset
+      valid_index <- folds[[fold]]  # indices of the validation subset
+      
+      x_train_fold <- X_train[train_index, ]
+      y_train_fold <- y[train_index]
+      x_valid_fold <- X_train[valid_index, ]
+      y_valid_fold <- y[valid_index]
+      
+      model <- glmnet(x_train_fold, y_train_fold, alpha = alphas[i], lambda = lambdas)
+      pred <- predict(model, X_train, s = lambdas)
+      
+      train_pred <- pred[train_index,]  # predictions for the training set
+      valid_pred <- pred[valid_index,]  # predictions for the validation set
+      
+      for (j in 1:length(lambdas)) {
+        # Training RMSE for each lambda
+        train_errors[j] <- sqrt(mean((train_pred[j] - y_train_fold)^2))
+        # Validation RMSE
+        valid_errors[j] <- sqrt(mean((valid_pred[j] - y_valid_fold)^2))
+      }
+    }
+    en_train_errors[i,] <- train_errors
+    en_valid_errors[i,] <- valid_errors
+}
+
+# Naming columns with appropriate values
+colnames(en_train_errors) <- lambdas
+colnames(en_valid_errors) <- lambdas
+rownames(en_train_errors) <- alphas
+rownames(en_valid_errors) <- alphas
+
+write.table(en_train_errors, file = "en_train_errors.csv")
+write.table(en_valid_errors, file = "en_valid_errors.csv")
+parallelStop()
+```
+
+```{r}
+# Select alpha and lambda with the smallest validation error
+indices <- which(en_valid_errors == min(en_valid_errors), arr.ind=TRUE)
+alphas[indices[1]]
+lambdas[indices[2]]
+
+# Mean validation error for selected parameters
+en_valid_err <- en_valid_errors[indices]
+en_train_err <- en_train_errors[indices]
+```
+
+```{r}
+en_valid_err
+en_train_err
+```
+
+
+## Random Forests
+
+Hyperparameters to be tested:
+
+* `mtry` -- the number of predictors randomly sampled for constructing a tree -- for regression problems, usually $m=\frac{p}{3}$ is used, so this will be one of the parameters considered
+* `max.depth` -- the maximum depth of the tree
+* `min.node.size` -- the minimum number of observations in a leaf
+
+```{r rf, eval=FALSE}
+parallelStartSocket(cpus=detectCores())
+p <- ncol(X_train)
+n <- nrow(X_train)
+
+# Create a hyperparameter grid
+rf_hyper_grid <- expand.grid(
+  mtry = floor(p * c(.01, .1, .333)),
+  min.node.size = c(5,10,20),
+  max.depth = c(10, 20, 50, NULL),
+  train_rmse = NA,
+  valid_rmse = NA
+)
+
+# Perform 5-fold cross-validation for each parameter combination
+for(i in seq_len(nrow(rf_hyper_grid))) {
+  train_errors <- c(1:k)
+  valid_errors <- c(1:k)
+  
+  for (fold in 1:k) {
+    
+      train_index <- unlist(folds[-fold])
+      valid_index <- folds[[fold]]
+      
+      x_train_fold <- X_train[train_index, ]
+      y_train_fold <- y[train_index]
+      x_valid_fold <- X_train[valid_index, ]
+      y_valid_fold <- y[valid_index]
+      
+      model <- ranger(
+          x               = x_train_fold,
+          y               = y_train_fold,
+          num.trees       = 50,
+          mtry            = rf_hyper_grid$mtry[i],
+          min.node.size   = rf_hyper_grid$min.node.size[i],
+          verbose         = FALSE,
+          seed            = 7,
+          max.depth       = rf_hyper_grid$max.depth[i]
+      )
+      
+      # Predictions for the validation set
+      valid_pred <- predict(model, x_valid_fold)$predictions
+
+      # Training RMSE
+      train_errors[fold] <- sqrt(model$prediction.error)
+      
+      # Validation RMSE
+      valid_errors[fold] <- sqrt(mean((valid_pred - y_valid_fold)^2))  
+  }
+  
+  # Mean RMSE values
+  rf_hyper_grid$train_rmse[i] <- mean(train_errors)
+  rf_hyper_grid$valid_rmse[i] <- mean(valid_errors)
+  
+}
+write.table(rf_hyper_grid, file = "rf_hyper_grid.csv")
+parallelStop()
+```
+
+```{r}
+# Choose parameters with smallest validation error
+index <- which.min(rf_hyper_grid$valid_rmse)
+
+rf_hyper_grid[index,]
+rf_best_params <- rf_hyper_grid[index,1:3]
+
+rf_valid_err <- rf_hyper_grid$valid_rmse[index]
+rf_train_err <- rf_hyper_grid$train_rmse[index]
+```
+
+## Model comparison
+
+```{r comparison, warning=FALSE}
+# Reference Model
+mean_y <- mean(y)
+
+train_errors <- c(1:k)
+valid_errors <- c(1:k)
+  
+for (fold in 1:k) {
+    
+  train_index <- unlist(folds[-fold])
+  valid_index <- folds[[fold]]
+      
+  x_train_fold <- X_train[train_index, ]
+  y_train_fold <- y[train_index]
+  x_valid_fold <- X_train[valid_index, ]
+  y_valid_fold <- y[valid_index]
+  
+  train_errors[fold] <- sqrt(mean((mean_y - y_train_fold)^2)) 
+  valid_errors[fold] <- sqrt(mean((mean_y - y_valid_fold)^2)) 
+  
+}  
+
+index <- which.min(valid_errors)
+ref_valid_err <- valid_errors[index]
+ref_train_err <- train_errors[index]
+
+summary <- matrix(c(en_train_err, en_valid_err, rf_train_err, rf_valid_err, ref_train_err, ref_valid_err), nrow=2)
+colnames(summary) <- c("ElasticNet", "RandomForest", "Reference")
+rownames(summary) <- c("training", "validation")
+summary
+```
+
+Comparing the test and validation errors, it’s not hard to see that the models based on random forests were able to fit the data much better. Such results are not surprising - random forests, using a random subset of predictors and observations each time, reduce the variance of the model. Thanks to this, they are much less prone to overfitting, the biggest threat in the case of the analyzed data. Additionally, they are able to model nonlinear dependencies between explanatory variables and the explained variable. Thus, of the models presented above, it is the random forests that are much more suitable for prediction.
+
+
+## Prediction on the test set
+
+### XGBoost
+
+The model used for prediction will be XGBoost, which creates strong models by combining information from many weak predictive models. It uses decision trees created sequentially, where each subsequent tree is adapted to correct the errors made by previous trees. XGBoost has built-in regularization mechanisms that help control the complexity of the model and prevent overfitting. You can adjust parameters such as tree depth, weight coefficients in the loss function, sampling of training data, etc. It has many hyperparameters, which I will optimize separately.
+
+```{r pca, eval=FALSE}
+# PCA - ultimately unused, because predictions without it gave a smaller error
+pca <- prcomp(X_train)
+var <- cumsum(pca$sdev^2)/sum(pca$sdev^2)
+ggplot() + geom_line(aes(x=c(1:n), y=var))
+end <- length(var[var<0.95])+1 # at which index do we have > 95% variance explained
+new_X <- pca$x[,1:end]
+```
+
+```{r xgboost, eval=FALSE}
+parallelStartSocket(cpus=detectCores())
+
+# Create an initial list of parameters
+param_list = list(
+objective = "reg:linear",
+eta = 0.01,
+gamma = 1,
+max_depth = 6,
+subsample = 0.8,
+colsample_bytree = 0.5
+)
+ 
+# Convert the data to the xgb.DMatrix format
+xgb_train <- xgb.DMatrix(data = new_X, label = y)
+
+# Multiply the test data by the principal directions
+new_X_test <- X_test %*% pca$rotation[,1:end]
+xgb_test = xgb.DMatrix(data = new_X_test)
+
+parallelStop()
+```
+
+### Hyperparameter tuning
+
+```{r, eval=FALSE}
+xtrain = X_train[train,]
+ytrain = y[train]
+xtest = X_train[test,]
+ytest = y[test]
+
+# Hyperparameter grid
+eta <- c(0.01, 0.3)
+cs <- c(1/3,2/3,1)
+md <- c(4,6,10)
+ss <- c(0.25,0.5,0.75,1)
+mcw <- c(1,10,100,400)
+gamma <- c(0.1,1,10,100)
+
+# Positions of standard values of parameters eta, cs, md, ss, mcw, gamma
+standard <- c(2, 3, 2, 1, 1, 1)
+
+parallelStartSocket(cpus=detectCores())
+
+# Search for the best eta
+set.seed(1)
+conv_eta = matrix(NA, 500,length(eta)) 
+pred_eta = matrix(NA,length(test), length(eta))
+colnames(conv_eta) = colnames(pred_eta) = eta
+for(i in 1:length(eta)){
+  params=list(eta = eta[i], colsample_bylevel=cs[standard[2]],
+              subsample = ss[standard[4]], max_depth = md[standard[3]],
+              min_child_weigth = 1)
+  xgb = xgboost(xtrain, label = ytrain, nrounds = 500, params = params)
+  conv_eta[,i] = xgb$evaluation_log$train_rmse
+  pred_eta[,i] = predict(xgb, xtest)
+}
+conv_eta = data.frame(iter=1:500, conv_eta)
+conv_eta = melt(conv_eta, id.vars = "iter")
+```
+
+```{r}
+ggplot(data = conv_eta) + geom_line(aes(x = iter, y = value, color = variable))
+```
+
+```{r, eval=FALSE}
+RMSE_eta = sqrt(colMeans((ytest-pred_eta)^2))
+best_eta <- as.numeric(names(which.min(RMSE_eta)))
+
+write.table(conv_eta, file = "conv_eta.csv")
+write.table(pred_eta, file = "pred_eta.csv")
+
+parallelStartSocket(cpus=detectCores())
+# Test the fraction of variables tested at each new node
+set.seed(1)
+conv_cs = matrix(NA, 500, length(cs))
+pred_cs = matrix(NA,length(test), length(cs))
+colnames(conv_cs) = colnames(pred_cs) = cs
+for(i in 1:length(cs)){
+  params = list(eta = eta[standard[1]], colsample_bylevel = cs[i],
+                subsample = ss[standard[4]], max_depth = md[standard[3]],
+                min_child_weigth = 1)
+  xgb=xgboost(xtrain, label = ytrain, nrounds = 500, params = params)
+  conv_cs[,i] = xgb$evaluation_log$train_rmse
+  pred_cs[,i] = predict(xgb, xtest)
+}
+conv_cs = data.frame(iter=1:500, conv_cs)
+conv_cs = melt(conv_cs, id.vars = "iter")
+```
+
+```{r}
+ggplot(data = conv_cs) + geom_line(aes(x = iter, y = value, color = variable))
+```
+
+```{r, eval=FALSE}
+RMSE_cs = sqrt(colMeans((ytest-pred_cs)^2))
+best_cs <- as.numeric(names(which.min(RMSE_cs)))
+
+write.table(conv_cs, file = "conv_cs.csv")
+write.table(pred_cs, file = "pred_cs.csv")
+
+# Search for the best tree depth
+set.seed(1)
+conv_md <- matrix(NA,500,length(md))
+pred_md <- matrix(NA,length(test), length(md))
+colnames(conv_md) = colnames(pred_md) = md
+for(i in 1:length(md)){
+  params = list(eta = eta[standard[1]], colsample_bylevel = cs[standard[2]],
+                subsample = ss[standard[4]], max_depth = md[i],
+                min_child_weigth = 1)
+  xgb=xgboost(xtrain, label = ytrain, nrounds = 500, params = params)
+  conv_md[,i] = xgb$evaluation_log$train_rmse
+  pred_md[,i] = predict(xgb, xtest)
+}
+conv_md <- data.frame(iter=1:500, conv_md)
+conv_md <- melt(conv_md, id.vars = "iter")
+ggplot(data = conv_md) + geom_line(aes(x = iter, y = value, color = variable))
+
+RMSE_md <- sqrt(colMeans((ytest-pred_md)^2))
+best_md <- as.numeric(names(which.min(RMSE_md)))
+
+write.table(conv_md, file = "conv_md.csv")
+write.table(pred_md, file = "pred_md.csv")
+
+# Search for the best subsample value
+set.seed(1)
+conv_ss=matrix(NA,500,length(ss))
+pred_ss=matrix(NA,length(test),length(ss))
+colnames(conv_ss)=colnames(pred_ss)=ss
+for(i in 1:length(ss)){
+  params=list(eta=eta[standard[1]],colsample_bylevel=cs[standard[2]],
+              subsample=ss[i],max_depth=md[standard[3]],
+              min_child_weigth=1)
+  xgb=xgboost(xtrain, label = ytrain,nrounds = 500,params=params)
+  conv_ss[,i] = xgb$evaluation_log$train_rmse
+  pred_ss[,i] = predict(xgb, xtest)
+}
+conv_ss=data.frame(iter=1:500,conv_ss)
+conv_ss=melt(conv_ss,id.vars = "iter")
+```
+
+```{r}
+ggplot(data=conv_ss)+geom_line(aes(x=iter,y=value,color=variable))
+```
+
+```{r, eval=FALSE}
+RMSE_ss <- sqrt(colMeans((ytest-pred_ss)^2))
+best_ss <- as.numeric(names(which.min(RMSE_ss)))
+
+write.table(conv_ss, file = "conv_ss.csv")
+write.table(pred_ss, file = "pred_ss.csv")
+
+# Search for the best min_child_weight value
+set.seed(1)
+conv_mcw = matrix(NA,500,length(mcw))
+pred_mcw = matrix(NA,length(test), length(mcw))
+colnames(conv_mcw) = colnames(pred_mcw) = mcw
+for(i in 1:length(mcw)){
+  params = list(eta = 0.1, colsample_bylevel=2/3,
+                subsample = 1, max_depth = 6,
+                min_child_weight = mcw[i], gamma = 0)
+  xgb = xgboost(xtrain, label = ytrain, nrounds = 500, params = params)
+  conv_mcw[,i] = xgb$evaluation_log$train_rmse
+  pred_mcw[,i] = predict(xgb, xtest)
+}
+conv_mcw = data.frame(iter=1:500, conv_mcw)
+conv_mcw = melt(conv_mcw, id.vars = "iter")
+```
+
+```{r}
+ggplot(data = conv_mcw) + geom_line(aes(x = iter, y = value, color = variable))
+```
+
+```{r, eval=FALSE}
+RMSE_mcw <- sqrt(colMeans((ytest-pred_mcw)^2))
+best_mcw <- as.numeric(names(which.min(RMSE_mcw)))
+
+write.table(conv_mcw, file = "conv_mcw.csv")
+write.table(pred_mcw, file = "pred_mcw.csv")
+
+# Search for the best gamma value
+set.seed(1)
+conv_gamma = matrix(NA,500,length(gamma))
+pred_gamma = matrix(NA,length(test), length(gamma))
+colnames(conv_gamma) = colnames(pred_gamma) = gamma
+for(i in 1:length(gamma)){
+  params = list(eta = 0.1, colsample_bylevel=2/3,
+                subsample = 1, max_depth = 6, min_child_weight = 1,
+                gamma = gamma[i])
+  xgb = xgboost(xtrain, label = ytrain, nrounds = 500, params = params)
+  conv_gamma[,i] = xgb$evaluation_log$train_rmse
+  pred_gamma[,i] = predict(xgb, xtest)
+}
+conv_gamma = data.frame(iter=1:500, conv_gamma)
+conv_gamma = melt(conv_gamma, id.vars = "iter")
+```
+
+```{r}
+ggplot(data = conv_gamma) + geom_line(aes(x = iter, y = value, color = variable))
+```
+
+```{r, eval=FALSE}
+RMSE_gamma <- sqrt(colMeans((ytest-pred_gamma)^2))
+best_gamma <- as.numeric(names(which.min(RMSE_gamma)))
+
+write.table(conv_gamma, file = "conv_gamma.csv")
+write.table(pred_gamma, file = "pred_gamma.csv")
+
+# Create an initial list of parameters
+param_list <- list(
+  objective = "reg:squarederror",
+  eta = best_eta,
+  gamma = best_gamma,
+  max_depth = best_md,
+  subsample = best_ss,
+  colsample_bylevel = best_cs,
+  min_child_weight = best_mcw)
+
+# Convert the data to the xgb.DMatrix format
+xgb_train <- xgb.DMatrix(data = X_train, label = y)
+xgb_test <- xgb.DMatrix(data = X_test)
+
+# 5-fold cross-validation to find the optimal number of algorithm runs
+set.seed(113)
+xgbcv2 <- xgb.cv(params = param_list,
+                data = xgb_train,
+                nrounds = 1000,
+                nfold = 5,
+                print_every_n = 10,
+                early_stopping_rounds = 30,
+                maximize = F)
+
+best_iter <- xgbcv2$best_iteration
+
+# Train XGBoost model with the found number of runs
+xgb_model2 = xgb.train(data = xgb_train,
+                      params = param_list,
+                      nrounds = best_iter,
+                      eval_metric = "error")
+xgb_model2
+
+predictions <- predict(object = xgb_model2, newdata = xgb_test)
+pred_table <- as.data.frame(c(0:669))
+colnames(pred_table) <- "Id"
+pred_table$Expected <- predictions
+write.table(pred_table, sep = ',', file = "pred_table.csv", row.names = FALSE)
+
+parallelStop()
+```
