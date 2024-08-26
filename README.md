@@ -12,5 +12,8 @@ Multimodal scRNA-seq provides two types of reads for each cell:
 * RNA transcript counts reflecting gene expression (marked as X),
 * Quantification of surface proteins, directly linked to cell types (marked as y).
 
+## Project structure
+The code is provided in the file ```RNA-seq.Rmd```, while the final output with the results of individual stages, including plots and tables generated from the R code – in the file ```RNA-seq.html```.
+
 ##
 The project is a final task in statistical data analysis.
