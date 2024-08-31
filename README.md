@@ -9,6 +9,7 @@ The primary goal is to predict surface protein signals based on gene expression 
 <p align="center">
   <img src="images/heatmap.png" />
 </p>
+
 *Heatmap of correlation between the expression of selected genes*
 
 ## Data
