@@ -7,10 +7,9 @@ This project involves the analysis of the data obtained from multimodal single c
 The primary goal is to predict surface protein signals based on gene expression data. This prediction is vital for most publicly available datasets where only RNA count matrices are available, as it aids in identifying and categorizing cells within the sample.
 
 <p align="center">
-  <img src="images/heatmap.png" />
+  <img src="images/heatmap.png" alt="correlation heatmap"/>
+  <i>Heatmap of correlation between the expression of selected genes</i>
 </p>
-
-*Heatmap of correlation between the expression of selected genes*
 
 ## Data
 Multimodal scRNA-seq provides two types of reads for each cell:
